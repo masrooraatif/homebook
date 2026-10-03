@@ -1,0 +1,22 @@
+{
+  "name": "homebook",
+  "version": "1.0.0",
+  "description": "Household income and expense dashboard. Node.js, Express, MySQL.",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20.6"
+  },
+  "scripts": {
+    "start": "node --env-file=.env server.js",
+    "dev": "node --watch --env-file=.env server.js",
+    "db:init": "node --env-file=.env scripts/init-db.js",
+    "db:seed": "node --env-file=.env scripts/seed-demo.js"
+  },
+  "dependencies": {
+    "express": "^5.1.0",
+    "mysql2": "^3.14.0",
+    "nodemailer": "^7.0.6",
+    "exceljs": "^4.4.0"
+  }
+}

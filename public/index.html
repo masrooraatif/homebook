@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Homebook</title>
+  <meta name="description" content="Monthly income, rent and household spending in one place.">
+  <meta name="theme-color" content="#F3F5F9" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#0E1424" media="(prefers-color-scheme: dark)">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" href="/icon.jpeg" >
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500..700&family=Instrument+Sans:wght@400..600&display=swap">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+
+  <!-- Sign-in (only shown when APP_PASSWORD is set) -->
+  <div class="login" id="login" hidden>
+    <form class="login-card" id="login-form">
+      <div class="brand"><span class="logo" data-icon="home"></span> Humaira Infotech</div>
+      <h1>Welcome back</h1>
+      <label class="field">Password
+        <input type="password" name="password" autocomplete="current-password" required>
+      </label>
+      <p class="form-error" id="login-error" role="alert" hidden></p>
+      <button class="btn primary" type="submit">Sign in</button>
+    </form>
+  </div>
+
+  <div class="app" id="app" hidden>
+    <aside class="side">
+      <div class="brand"><span class="logo"><img src="/icon.jpeg" alt="Humaira infotech" style="width: 100%;height: 100%;object-fit: cover;border-radius: inherit;"></span> Humaira Infotech</div>
+      <nav class="nav" aria-label="Main">
+        <a href="#/dashboard" data-route="dashboard" data-icon="dash">Dashboard</a>
+        <a href="#/transactions" data-route="transactions" data-icon="list">Transactions</a>
+        <a href="#/budgets" data-route="budgets" data-icon="target">Budgets</a>
+        <a href="#/settings" data-route="settings" data-icon="sliders">Settings</a>
+      </nav>
+      <button class="btn primary wide" data-action="add" data-icon="plus">Add entry</button>
+    </aside>
+
+    <div class="main">
+      <header class="top">
+        <h1 id="title">Dashboard</h1>
+        <div class="months" id="months">
+          <button class="icon-btn" data-action="prev" aria-label="Previous month" data-icon="left"></button>
+          <button class="month-label" id="month-label" data-action="today" aria-label="Go to this month"></button>
+          <button class="icon-btn" data-action="next" aria-label="Next month" data-icon="right"></button>
+        </div>
+      </header>
+      <main id="view" tabindex="-1"></main>
+    </div>
+
+    <nav class="tabbar" aria-label="Main">
+      <a href="#/dashboard" data-route="dashboard" data-icon="dash"><span>Home</span></a>
+      <a href="#/transactions" data-route="transactions" data-icon="list"><span>Entries</span></a>
+      <button class="fab" data-action="add" aria-label="Add entry" data-icon="plus"></button>
+      <a href="#/budgets" data-route="budgets" data-icon="target"><span>Budgets</span></a>
+      <a href="#/settings" data-route="settings" data-icon="sliders"><span>Settings</span></a>
+    </nav>
+  </div>
+
+  <dialog id="entry" aria-labelledby="entry-title">
+    <form id="entry-form" class="sheet" novalidate>
+      <div class="sheet-head">
+        <h2 id="entry-title">Add entry</h2>
+        <button type="button" class="icon-btn" data-action="close" aria-label="Close" data-icon="close"></button>
+      </div>
+
+      <div class="toggle" role="radiogroup" aria-label="Entry type">
+        <label data-t="expense"><input type="radio" name="type" value="expense" checked> Spending</label>
+        <label data-t="income"><input type="radio" name="type" value="income"> Income</label>
+      </div>
+
+      <label class="amount">
+        <span class="cur" id="cur-sym"></span>
+        <input id="f-amount" name="amount" inputmode="decimal" autocomplete="off" placeholder="0" aria-label="Amount" required>
+      </label>
+
+      <div class="row2">
+        <label class="field">Category
+          <select name="category_id" id="f-cat"></select>
+        </label>
+        <label class="field">Date
+          <input type="date" name="date" id="f-date" required>
+        </label>
+      </div>
+
+      <label class="field">Note
+        <input name="note" id="f-note" maxlength="255" placeholder="What was it for?" autocomplete="off">
+      </label>
+
+      <label class="check" id="repeat-row">
+        <input type="checkbox" name="repeat">
+        <span>Repeat every month <small>Good for rent, salary and bills</small></span>
+      </label>
+
+      <p class="form-error" id="f-error" role="alert" hidden></p>
+
+      <div class="sheet-actions">
+        <button type="button" class="btn danger" id="btn-delete" data-action="delete-entry" hidden>Delete</button>
+        <button type="submit" class="btn primary" id="btn-save">Save entry</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
