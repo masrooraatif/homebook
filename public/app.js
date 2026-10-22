@@ -6,6 +6,10 @@ const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => (
   { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
 ));
 
+/* small style add-on for sub-categories (no CSS file change needed) */
+document.head.insertAdjacentHTML('beforeend',
+  '<style>.category-manage-row.sub,.cat-row.sub{margin-left:22px;font-size:.92em}</style>');
+
 /* ---------- theme (auto / light / dark) ---------- */
 const THEME_KEY = 'hb-theme';
 function getTheme() { try { return localStorage.getItem(THEME_KEY) || 'auto'; } catch { return 'auto'; } }
@@ -52,6 +56,16 @@ const EMOJI_RULES = [
 const catEmoji = (name) => EMOJI_RULES.find(([re]) => re.test(name || ''))?.[1] ?? '';
 const emo = (name) => { const e = catEmoji(name); return e ? `<span class="emo">${e}</span>` : ''; };
 const catLabel = (name) => `${emo(name)}${esc(name)}`;
+
+/* ---------- sub-category helpers ---------- */
+// "Market Items › Veg" for a sub-category, plain name otherwise
+const catPath = (c) => {
+  const p = c.parent_id && state.meta.categories.find((x) => x.id === c.parent_id);
+  return p ? `${p.name} › ${c.name}` : c.name;
+};
+// parents first, each followed by its sub-categories
+const orderedCats = (list) => list.filter((c) => !c.parent_id)
+  .flatMap((p) => [p, ...list.filter((c) => c.parent_id === p.id)]);
 
 /* ---------- state and formatting ---------- */
 const LOCALES = { INR: 'en-IN', USD: 'en-US', EUR: 'en-IE', GBP: 'en-GB', AED: 'en-AE', SGD: 'en-SG', AUD: 'en-AU', CAD: 'en-CA' };
@@ -204,6 +218,25 @@ function pendingBanner(s) {
   </div>`;
 }
 
+/* Groups sub-categories under their parent: Market Items = Veg + Non-Veg */
+function groupCats(cats) {
+  const byId = new Map(state.meta.categories.map((c) => [c.id, c]));
+  const groups = new Map();
+  for (const c of cats) {
+    const pid = byId.get(c.id)?.parent_id;
+    const key = pid || c.id;
+    if (!groups.has(key)) {
+      const p = byId.get(key) || c;
+      groups.set(key, { id: key, name: p.name, color: p.color, total: 0, share: 0, subs: [] });
+    }
+    const g = groups.get(key);
+    g.total += c.total;
+    g.share += c.share;
+    if (pid) g.subs.push(c);
+  }
+  return [...groups.values()].sort((a, b) => b.total - a.total);
+}
+
 function donutHTML(cats, total) {
   const R = 15.9155;
   const top = cats.slice(0, 6).map((c) => ({ name: c.name, color: c.color, v: c.total }));
@@ -230,7 +263,7 @@ function donutHTML(cats, total) {
 /* ---------- insights ---------- */
 function insightsHTML(s) {
   const items = [];
-  const top = s.categories[0];
+  const top = groupCats(s.categories)[0];
   if (top && s.expense > 0) {
     items.push({ ic: catEmoji(top.name) || '📊', tone: '',
       text: `<b>${esc(top.name)}</b> is your biggest spend: ${m0(top.total)}, ${Math.round(top.share * 100)}% of spending.` });
@@ -366,15 +399,16 @@ function renderDashboard() {
   if (!s.hasData) return firstRun();
   if (!s.income && !s.expense) return emptyMonth(s);
 
+  const groups = groupCats(s.categories);
   const left = s.balance;
   const over = left < 0;
   const scale = Math.max(s.income, s.expense) || 1;
-  const segs = s.categories.map((c) =>
-    `<span class="seg" style="--w:${((c.total / scale) * 100).toFixed(2)};--c:${esc(c.color)}" title="${esc(c.name)}: ${m0(c.total)}"></span>`).join('');
+  const segs = groups.map((g) =>
+    `<span class="seg" style="--w:${((g.total / scale) * 100).toFixed(2)};--c:${esc(g.color)}" title="${esc(g.name)}: ${m0(g.total)}"></span>`).join('');
   const leftSeg = left > 0
     ? `<span class="seg left" style="--w:${((left / scale) * 100).toFixed(2)}" title="Left over: ${m0(left)}"></span>` : '';
-  const legend = s.categories.slice(0, 4).map((c) =>
-    `<li><i style="--c:${esc(c.color)}"></i>${esc(c.name)} ${m0(c.total)}</li>`).join('')
+  const legend = groups.slice(0, 4).map((g) =>
+    `<li><i style="--c:${esc(g.color)}"></i>${esc(g.name)} ${m0(g.total)}</li>`).join('')
     + (left > 0 ? `<li><i class="left"></i>Left over ${m0(left)}</li>` : '');
   const rate = s.savingsRate === null ? '–' : `${Math.round(s.savingsRate * 100)}%`;
 
@@ -400,12 +434,16 @@ function renderDashboard() {
   const breakdown = s.expense > 0 ? `<section class="panel">
     <div class="panel-head"><h2>Where the money went</h2></div>
     <div class="split">
-      ${donutHTML(s.categories, s.expense)}
-      <ul class="cat-list">${s.categories.map((c) => `<li>
-        <button class="cat-row" data-action="cat" data-id="${c.id}" style="--c:${esc(c.color)}">
-          <span class="dot"></span><span>${catLabel(c.name)}</span><span class="amt">${m0(c.total)}</span>
-          <small>${Math.round(c.share * 100)}% of spending</small>
-        </button></li>`).join('')}</ul>
+      ${donutHTML(groups, s.expense)}
+      <ul class="cat-list">${groups.map((g) => `<li>
+        <button class="cat-row" data-action="cat" data-id="${g.id}" style="--c:${esc(g.color)}">
+          <span class="dot"></span><span>${catLabel(g.name)}</span><span class="amt">${m0(g.total)}</span>
+          <small>${Math.round(g.share * 100)}% of spending</small>
+        </button>
+        ${g.subs.map((sc) => `<button class="cat-row sub" data-action="cat" data-id="${sc.id}" style="--c:${esc(g.color)}">
+          <span class="dot"></span><span>${esc(sc.name)}</span><span class="amt">${m0(sc.total)}</span>
+        </button>`).join('')}
+      </li>`).join('')}</ul>
     </div>
   </section>` : '';
 
@@ -477,9 +515,8 @@ function renderTransactions() {
   const f = state.filters;
   const chips = [['', 'All'], ['expense', 'Spending'], ['income', 'Income']]
     .map(([v, l]) => `<button class="chip ${f.type === v ? 'on' : ''}" data-action="type" data-type="${v}">${l}</button>`).join('');
-  const cats = state.meta.categories
-    .filter((c) => !f.type || c.type === f.type)
-    .map((c) => `<option value="${c.id}" ${String(f.category) === String(c.id) ? 'selected' : ''}>${esc(c.name)}</option>`).join('');
+  const cats = orderedCats(state.meta.categories.filter((c) => !f.type || c.type === f.type))
+    .map((c) => `<option value="${c.id}" ${String(f.category) === String(c.id) ? 'selected' : ''}>${esc(catPath(c))}</option>`).join('');
   return `<div class="filters">
       <div class="chips">${chips}</div>
       <div class="filter-row">
@@ -544,10 +581,11 @@ async function loadSettings() {
 function renderSettings() {
   const m = state.meta;
   const theme = getTheme();
-  const categories = [...m.categories].sort((a, b) => a.type.localeCompare(b.type) || a.name.localeCompare(b.name));
-  const categoryRows = categories.map((c) => `<div class="category-manage-row">
+  const sorted = [...m.categories].sort((a, b) => a.type.localeCompare(b.type) || a.name.localeCompare(b.name));
+  const categoryRows = orderedCats(sorted).map((c) => `<div class="category-manage-row ${c.parent_id ? 'sub' : ''}">
       <span class="category-chip" style="--c:${esc(c.color)}"><i></i>${catLabel(c.name)}</span>
       <small>${c.type === 'expense' ? 'Spending' : 'Income'}</small>
+      ${c.parent_id ? '' : `<button class="btn small" data-action="add-sub" data-id="${c.id}">+ sub</button>`}
     </div>`).join('');
   const rec = state.recurring.length
     ? state.recurring.map((r) => `<div class="rec-row" style="--c:${esc(r.color)}">
@@ -573,7 +611,7 @@ function renderSettings() {
         <select id="currency" aria-label="Currency">${m.currencies.map((c) => `<option ${c === m.currency ? 'selected' : ''}>${c}</option>`).join('')}</select></div>
     </section>
     <section class="panel category-panel">
-      <div class="panel-head"><div><h2>Categories</h2><small>Create your own income or spending categories.</small></div></div>
+      <div class="panel-head"><div><h2>Categories</h2><small>Create your own income or spending categories. Use "+ sub" to add a sub-category under one.</small></div></div>
       <form id="category-form" class="category-form">
         <label class="field">Name<input name="name" maxlength="80" placeholder="e.g. School fees" required></label>
         <label class="field">Type<select name="type"><option value="expense">Spending</option><option value="income">Income</option></select></label>
@@ -656,13 +694,33 @@ function onRoute() {
 const dialog = () => $('#entry');
 let editingId = null;
 
-function fillCategories(type, selected) {
-  const opts = state.meta.categories.filter((c) => c.type === type)
-    .map((c) => `<option value="${c.id}">${esc(c.name)}</option>`).join('');
-  const sel = $('#f-cat');
-  sel.innerHTML = opts;
-  if (selected) sel.value = String(selected);
+// adds a "Sub-category" dropdown under the category dropdown (once)
+function ensureSubField() {
+  if ($('#f-sub')) return;
+  const host = $('#f-cat').closest('label') || $('#f-cat').parentElement;
+  host.insertAdjacentHTML('afterend',
+    '<label class="field" id="sub-field" hidden>Sub-category<select id="f-sub" name="sub_category_id"></select></label>');
+  $('#f-cat').addEventListener('change', () => renderSubs());
 }
+
+function renderSubs(selectedSub) {
+  const subs = state.meta.categories.filter((c) => c.parent_id === Number($('#f-cat').value));
+  $('#sub-field').hidden = !subs.length;
+  $('#f-sub').innerHTML = '<option value="">No sub-category</option>'
+    + subs.map((s) => `<option value="${s.id}">${esc(s.name)}</option>`).join('');
+  if (selectedSub) $('#f-sub').value = String(selectedSub);
+}
+
+function fillCategories(type, selected) {
+  ensureSubField();
+  const tops = state.meta.categories.filter((c) => c.type === type && !c.parent_id);
+  $('#f-cat').innerHTML = tops.map((c) => `<option value="${c.id}">${esc(c.name)}</option>`).join('');
+  const cur = state.meta.categories.find((c) => c.id === Number(selected));
+  const parentId = cur?.parent_id || selected;
+  if (parentId) $('#f-cat').value = String(parentId);
+  renderSubs(cur?.parent_id ? cur.id : '');
+}
+
 function formError(msg) {
   const el = $('#f-error');
   el.textContent = msg;
@@ -698,7 +756,8 @@ async function submitEntry(e) {
   if (!fd.get('date')) return formError('Pick a date.');
   const body = {
     type: fd.get('type'),
-    category_id: Number(fd.get('category_id')),
+    // a chosen sub-category wins, otherwise the main category
+    category_id: Number(fd.get('sub_category_id') || fd.get('category_id')),
     amount,
     date: fd.get('date'),
     note: fd.get('note'),
@@ -739,6 +798,19 @@ document.addEventListener('click', async (e) => {
       case 'add': openEntry(); break;
       case 'add-income': openEntry(null, 'income'); break;
       case 'add-expense': openEntry(null, 'expense'); break;
+      case 'add-sub': {
+        const parent = state.meta.categories.find((c) => c.id === Number(el.dataset.id));
+        const name = prompt(`New sub-category under "${parent.name}"`);
+        if (!name || !name.trim()) break;
+        await api('/categories', {
+          method: 'POST',
+          body: { name: name.trim(), type: parent.type, color: parent.color, parent_id: parent.id },
+        });
+        state.meta = await api('/meta');
+        toast('Sub-category added');
+        await refresh();
+        break;
+      }
       case 'edit': openEntry(state.txIndex.get(Number(el.dataset.id))); break;
       case 'close': dialog().close(); break;
       case 'prev': state.month = shiftMonth(state.month, -1); await refresh(); break;

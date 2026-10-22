@@ -167,32 +167,55 @@ const csvCell = (v) => {
   return /[",\n\r]/.test(s) ? `"${s.replaceAll('"', '""')}"` : s;
 };
 
-/* ---------- categories ---------- */
+/* ---------- categories (with sub-categories) ---------- */
 
 api.post('/categories', async (req, res) => {
   const name = String(req.body?.name ?? '').trim().slice(0, 80);
-  const type = req.body?.type;
+  let type = req.body?.type;
   const color = /^#[0-9A-Fa-f]{6}$/.test(req.body?.color) ? req.body.color : '#2B45D4';
   if (name.length < 2) throw httpError(400, 'Category name must be at least 2 characters.');
+
+  // optional parent: makes this a sub-category
+  let parentId = null;
+  const rawParent = req.body?.parent_id;
+  if (rawParent !== undefined && rawParent !== null && rawParent !== '') {
+    parentId = idParam(rawParent);
+    const [p] = await pool.query('SELECT id, type, parent_id FROM categories WHERE id = ?', [parentId]);
+    if (!p.length) throw httpError(400, 'Parent category not found.');
+    if (p[0].parent_id) throw httpError(400, 'A sub-category cannot have its own sub-categories.');
+    type = p[0].type; // a sub-category always uses its parent's type
+  }
   if (!['income', 'expense'].includes(type)) throw httpError(400, 'Choose income or spending.');
-  const base = slugifyCategory(name);
-  if (!base) throw httpError(400, 'Choose a valid category name.');
-  const [exists] = await pool.query('SELECT id FROM categories WHERE name = ? OR slug = ? LIMIT 1', [name, base]);
+
+  const clean = slugifyCategory(name);
+  if (!clean) throw httpError(400, 'Choose a valid category name.');
+  const slug = parentId ? `${clean.slice(0, 30)}_p${parentId}` : clean;
+
+  const [exists] = parentId
+    ? await pool.query(
+        'SELECT id FROM categories WHERE parent_id = ? AND (name = ? OR slug = ?) LIMIT 1',
+        [parentId, name, slug],
+      )
+    : await pool.query(
+        'SELECT id FROM categories WHERE (name = ? AND parent_id IS NULL) OR slug = ? LIMIT 1',
+        [name, slug],
+      );
   if (exists.length) throw httpError(409, 'That category already exists.');
+
   const [maxRows] = await pool.query('SELECT COALESCE(MAX(sort_order), 0) AS maxOrder FROM categories WHERE type = ?', [type]);
   const sortOrder = Number(maxRows[0].maxOrder) + 1;
   const [r] = await pool.query(
-    'INSERT INTO categories (slug,name,type,color,sort_order) VALUES (?,?,?,?,?)',
-    [base, name, type, color, sortOrder],
+    'INSERT INTO categories (slug,name,type,color,sort_order,parent_id) VALUES (?,?,?,?,?,?)',
+    [slug, name, type, color, sortOrder, parentId],
   );
-  res.status(201).json({ id: r.insertId, slug: base, name, type, color });
+  res.status(201).json({ id: r.insertId, slug, name, type, color, parent_id: parentId });
 });
 
 /* ---------- meta and settings ---------- */
 
 api.get('/meta', async (req, res) => {
   const [categories] = await pool.query(
-    'SELECT id, slug, name, type, color FROM categories ORDER BY type, sort_order, name',
+    'SELECT id, slug, name, type, color, parent_id FROM categories ORDER BY type, sort_order, name',
   );
   const [settings] = await pool.query("SELECT v FROM settings WHERE k = 'currency'");
   const [any] = await pool.query('SELECT 1 FROM transactions LIMIT 1');
@@ -284,8 +307,10 @@ api.get('/transactions', async (req, res) => {
     args.push(req.query.type);
   }
   if (req.query.category) {
-    where.push('t.category_id = ?');
-    args.push(idParam(req.query.category));
+    // a parent category also matches the entries of its sub-categories
+    const cid = idParam(req.query.category);
+    where.push('(t.category_id = ? OR c.parent_id = ?)');
+    args.push(cid, cid);
   }
   const q = String(req.query.q ?? '').trim().slice(0, 80);
   if (q) {
@@ -296,9 +321,11 @@ api.get('/transactions', async (req, res) => {
   const limit = Math.min(Math.max(Number.parseInt(req.query.limit, 10) || 500, 1), 1000);
 
   const [rows] = await pool.query(
-    `SELECT t.id, t.type, t.category_id, c.name AS category, c.color, t.amount,
+    `SELECT t.id, t.type, t.category_id, CONCAT_WS(' › ', p.name, c.name) AS category, c.color, t.amount,
             t.tx_date AS date, t.note, t.recurring_id
-       FROM transactions t JOIN categories c ON c.id = t.category_id
+       FROM transactions t
+       JOIN categories c ON c.id = t.category_id
+       LEFT JOIN categories p ON p.id = c.parent_id
       ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
       ORDER BY t.tx_date DESC, t.id DESC
       LIMIT ?`,
@@ -423,8 +450,10 @@ api.delete('/recurring/:id', async (req, res) => {
 
 api.get('/export.xlsx', async (req, res) => {
   const [rows] = await pool.query(
-    `SELECT t.tx_date AS date, t.type, c.name AS category, t.amount, t.note
-       FROM transactions t JOIN categories c ON c.id = t.category_id
+    `SELECT t.tx_date AS date, t.type, CONCAT_WS(' › ', p.name, c.name) AS category, t.amount, t.note
+       FROM transactions t
+       JOIN categories c ON c.id = t.category_id
+       LEFT JOIN categories p ON p.id = c.parent_id
       ORDER BY t.tx_date, t.id`,
   );
   const [budgetRowsAll] = await pool.query(
@@ -509,8 +538,10 @@ api.get('/export.xlsx', async (req, res) => {
 
 api.get('/export.csv', async (req, res) => {
   const [rows] = await pool.query(
-    `SELECT t.tx_date, t.type, c.name AS category, t.amount, t.note
-       FROM transactions t JOIN categories c ON c.id = t.category_id
+    `SELECT t.tx_date, t.type, CONCAT_WS(' › ', p.name, c.name) AS category, t.amount, t.note
+       FROM transactions t
+       JOIN categories c ON c.id = t.category_id
+       LEFT JOIN categories p ON p.id = c.parent_id
       ORDER BY t.tx_date, t.id`,
   );
   const lines = ['Date,Type,Category,Amount,Note'];
