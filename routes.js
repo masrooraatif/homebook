@@ -9,6 +9,20 @@ import {
 
 const api = Router();
 
+// Goals table is created automatically so existing databases need no manual migration.
+try {
+  await pool.query(`CREATE TABLE IF NOT EXISTS goals (
+    id         INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    name       VARCHAR(80)   NOT NULL,
+    target     DECIMAL(12,2) NOT NULL,
+    saved      DECIMAL(12,2) NOT NULL DEFAULT 0,
+    color      CHAR(7)       NOT NULL DEFAULT '#2F52E0',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+} catch (err) {
+  console.error('Could not create goals table:', err.message);
+}
+
 const CURRENCIES = ['INR', 'USD', 'EUR', 'GBP', 'AED', 'SGD', 'AUD', 'CAD'];
 
 const mailer = process.env.EMAIL_HOST && process.env.EMAIL_USER && process.env.EMAIL_PASS
@@ -146,14 +160,14 @@ async function pendingRecurring(conn, month) {
 async function budgetRows(month) {
   const [start, next] = monthRange(month);
   const [rows] = await pool.query(
-    `SELECT c.id, c.name, c.color, COALESCE(b.amount, 0) AS budget, COALESCE(s.spent, 0) AS spent
+    `SELECT c.id, c.name, c.color, c.parent_id, COALESCE(b.amount, 0) AS budget,
+            COALESCE((SELECT SUM(t.amount)
+                        FROM transactions t
+                        JOIN categories tc ON tc.id = t.category_id
+                       WHERE t.type = 'expense' AND t.tx_date >= ? AND t.tx_date < ?
+                         AND (tc.id = c.id OR tc.parent_id = c.id)), 0) AS spent
        FROM categories c
        LEFT JOIN budgets b ON b.category_id = c.id
-       LEFT JOIN (
-         SELECT category_id, SUM(amount) AS spent
-           FROM transactions
-          WHERE type = 'expense' AND tx_date >= ? AND tx_date < ?
-          GROUP BY category_id) s ON s.category_id = c.id
       WHERE c.type = 'expense'
       ORDER BY c.sort_order, c.name`,
     [start, next],
@@ -211,6 +225,189 @@ api.post('/categories', async (req, res) => {
   res.status(201).json({ id: r.insertId, slug, name, type, color, parent_id: parentId });
 });
 
+/* ---------- quick add: your most repeated spending ---------- */
+
+api.get('/quick', async (req, res) => {
+  const since = `${addMonths(currentMonth(), -3)}-01`;
+  const [rows] = await pool.query(
+    `SELECT t.type, t.category_id, t.amount, t.note,
+            CONCAT_WS(' › ', p.name, c.name) AS category, c.color,
+            COUNT(*) AS n, MAX(t.tx_date) AS last_date
+       FROM transactions t
+       JOIN categories c ON c.id = t.category_id
+       LEFT JOIN categories p ON p.id = c.parent_id
+      WHERE t.type = 'expense' AND t.tx_date >= ? AND t.recurring_id IS NULL
+      GROUP BY t.type, t.category_id, t.amount, t.note, c.name, p.name, c.color
+     HAVING n >= 2
+      ORDER BY n DESC, last_date DESC
+      LIMIT 6`,
+    [since],
+  );
+  res.json(rows.map((r) => ({
+    type: r.type, category_id: r.category_id, amount: num(r.amount), note: r.note,
+    category: r.category, color: r.color, count: num(r.n),
+  })));
+});
+
+/* ---------- yearly report ---------- */
+
+api.get('/report', async (req, res) => {
+  const thisYear = Number(currentMonth().slice(0, 4));
+  const year = req.query.year ? Number.parseInt(req.query.year, 10) : thisYear;
+  if (!Number.isInteger(year) || year < 2000 || year > 2100) throw httpError(400, 'Choose a valid year.');
+
+  const [rows] = await pool.query(
+    `SELECT c.id, c.name, c.color, c.type, c.parent_id,
+            p.name AS parent_name, p.color AS parent_color,
+            MONTH(t.tx_date) AS m, SUM(t.amount) AS total
+       FROM transactions t
+       JOIN categories c ON c.id = t.category_id
+       LEFT JOIN categories p ON p.id = c.parent_id
+      WHERE t.tx_date >= ? AND t.tx_date < ?
+      GROUP BY c.id, m`,
+    [`${year}-01-01`, `${year + 1}-01-01`],
+  );
+  const [yearRows] = await pool.query('SELECT DISTINCT YEAR(tx_date) AS y FROM transactions ORDER BY y DESC');
+
+  const months = Array.from({ length: 12 }, (_, i) => ({ month: `${year}-${pad(i + 1)}`, income: 0, expense: 0 }));
+  const groups = new Map();
+  for (const r of rows) {
+    const amt = num(r.total);
+    months[r.m - 1][r.type] += amt;
+    if (r.type !== 'expense') continue;
+    const rootId = r.parent_id ?? r.id;
+    if (!groups.has(rootId)) {
+      groups.set(rootId, {
+        id: rootId,
+        name: r.parent_id ? r.parent_name : r.name,
+        color: r.parent_id ? r.parent_color : r.color,
+        total: 0, months: Array(12).fill(0), kids: new Map(),
+      });
+    }
+    const g = groups.get(rootId);
+    g.total += amt;
+    g.months[r.m - 1] += amt;
+    const kidId = r.parent_id ? r.id : 'direct';
+    const kidName = r.parent_id ? r.name : 'General';
+    const kid = g.kids.get(kidId) ?? { id: r.id, name: kidName, total: 0 };
+    kid.total += amt;
+    g.kids.set(kidId, kid);
+  }
+
+  const income = months.reduce((a, m) => a + m.income, 0);
+  const expense = months.reduce((a, m) => a + m.expense, 0);
+  const active = months.filter((m) => m.income || m.expense);
+  const categories = [...groups.values()]
+    .map((g) => {
+      const kids = [...g.kids.values()];
+      const hasSubs = kids.some((k) => k.name !== 'General');
+      return {
+        id: g.id, name: g.name, color: g.color, total: g.total, months: g.months,
+        share: expense > 0 ? g.total / expense : 0,
+        children: hasSubs
+          ? kids.sort((a, b) => b.total - a.total).map((k) => ({ ...k, share: g.total > 0 ? k.total / g.total : 0 }))
+          : [],
+      };
+    })
+    .sort((a, b) => b.total - a.total);
+
+  res.json({
+    year,
+    years: yearRows.map((r) => r.y),
+    income, expense, saved: income - expense,
+    savingsRate: income > 0 ? (income - expense) / income : null,
+    activeMonths: active.length,
+    months,
+    categories,
+  });
+});
+
+/* ---------- savings goals ---------- */
+
+const goalOut = (r) => ({ id: r.id, name: r.name, color: r.color, target: num(r.target), saved: num(r.saved) });
+
+api.get('/goals', async (req, res) => {
+  const [rows] = await pool.query('SELECT id, name, target, saved, color FROM goals ORDER BY id DESC');
+  res.json(rows.map(goalOut));
+});
+
+api.post('/goals', async (req, res) => {
+  const name = String(req.body?.name ?? '').trim().slice(0, 80);
+  const target = Math.round(Number(req.body?.target) * 100) / 100;
+  if (!name) throw httpError(400, 'Give your goal a name.');
+  if (!(target > 0) || target >= 1e10) throw httpError(400, 'Enter a target amount greater than zero.');
+  const colors = ['#2F52E0', '#0E9F73', '#E5484D', '#7A4DE8', '#F59E0B', '#0C8599'];
+  const [[{ n }]] = await pool.query('SELECT COUNT(*) AS n FROM goals');
+  const color = colors[n % colors.length];
+  const [r] = await pool.query('INSERT INTO goals (name, target, color) VALUES (?,?,?)', [name, target, color]);
+  res.status(201).json({ id: r.insertId, name, color, target, saved: 0 });
+});
+
+api.put('/goals/:id', async (req, res) => {
+  const id = idParam(req.params.id);
+  const add = Math.round(Number(req.body?.add) * 100) / 100;
+  if (!Number.isFinite(add) || add === 0 || Math.abs(add) >= 1e10) throw httpError(400, 'Enter an amount to add.');
+  const [r] = await pool.query('UPDATE goals SET saved = GREATEST(saved + ?, 0) WHERE id = ?', [add, id]);
+  if (r.affectedRows === 0) throw httpError(404, 'That goal no longer exists.');
+  const [rows] = await pool.query('SELECT id, name, target, saved, color FROM goals WHERE id = ?', [id]);
+  res.json(goalOut(rows[0]));
+});
+
+api.delete('/goals/:id', async (req, res) => {
+  const [r] = await pool.query('DELETE FROM goals WHERE id = ?', [idParam(req.params.id)]);
+  if (r.affectedRows === 0) throw httpError(404, 'That goal no longer exists.');
+  res.status(204).end();
+});
+
+/* ---------- full backup (JSON) ---------- */
+
+api.get('/backup.json', async (req, res) => {
+  const dump = {};
+  for (const table of ['categories', 'recurring', 'transactions', 'budgets', 'goals', 'settings']) {
+    const [rows] = await pool.query(`SELECT * FROM ${table}`);
+    dump[table] = rows;
+  }
+  res.set({
+    'Content-Type': 'application/json; charset=utf-8',
+    'Content-Disposition': `attachment; filename="homebook-backup-${today()}.json"`,
+    'Cache-Control': 'no-store',
+  });
+  res.send(JSON.stringify({ app: 'homebook', exported_at: new Date().toISOString(), ...dump }, null, 2));
+});
+
+/* ---------- delete a category or sub-category ---------- */
+
+api.delete('/categories/:id', async (req, res) => {
+  const id = idParam(req.params.id);
+  const [rows] = await pool.query('SELECT id, parent_id FROM categories WHERE id = ?', [id]);
+  if (!rows.length) throw httpError(404, 'Category not found.');
+  const cat = rows[0];
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    if (cat.parent_id) {
+      // Sub-category: its entries and repeats move up to the parent, so no totals are lost.
+      await conn.query('UPDATE transactions SET category_id = ? WHERE category_id = ?', [cat.parent_id, id]);
+      await conn.query('UPDATE recurring SET category_id = ? WHERE category_id = ?', [cat.parent_id, id]);
+    } else {
+      const [[{ kids }]] = await conn.query('SELECT COUNT(*) AS kids FROM categories WHERE parent_id = ?', [id]);
+      const [[{ used }]] = await conn.query('SELECT COUNT(*) AS used FROM transactions WHERE category_id = ?', [id]);
+      const [[{ rec }]] = await conn.query('SELECT COUNT(*) AS rec FROM recurring WHERE category_id = ?', [id]);
+      if (kids) throw httpError(400, 'Delete its sub-categories first.');
+      if (used || rec) throw httpError(400, 'This category has entries. Edit or delete them first.');
+    }
+    await conn.query('DELETE FROM categories WHERE id = ?', [id]);
+    await conn.commit();
+    res.json({ ok: true });
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+});
+
 /* ---------- meta and settings ---------- */
 
 api.get('/meta', async (req, res) => {
@@ -246,11 +443,34 @@ api.get('/summary', async (req, res) => {
   const trendStart = `${addMonths(month, -11)}-01`;
 
   const [catRows] = await pool.query(
-    `SELECT c.id, c.name, c.color, c.type, SUM(t.amount) AS total, COUNT(*) AS entries
-       FROM transactions t JOIN categories c ON c.id = t.category_id
+    `SELECT c.id, c.name, c.color, c.type, c.parent_id,
+            p.name AS parent_name, p.color AS parent_color,
+            SUM(t.amount) AS total, COUNT(*) AS entries
+       FROM transactions t
+       JOIN categories c ON c.id = t.category_id
+       LEFT JOIN categories p ON p.id = c.parent_id
       WHERE t.tx_date >= ? AND t.tx_date < ?
       GROUP BY c.id ORDER BY total DESC`,
     [start, next],
+  );
+
+  const [dailyRows] = await pool.query(
+    `SELECT DAY(tx_date) AS d, SUM(amount) AS total
+       FROM transactions WHERE type = 'expense' AND tx_date >= ? AND tx_date < ?
+      GROUP BY d ORDER BY d`,
+    [start, next],
+  );
+  const [prevStart, prevNext] = monthRange(addMonths(month, -1));
+  const [prevCatRows] = await pool.query(
+    `SELECT c.id, c.name, c.color, c.type, c.parent_id,
+            p.name AS parent_name, p.color AS parent_color,
+            SUM(t.amount) AS total, COUNT(*) AS entries
+       FROM transactions t
+       JOIN categories c ON c.id = t.category_id
+       LEFT JOIN categories p ON p.id = c.parent_id
+      WHERE t.tx_date >= ? AND t.tx_date < ?
+      GROUP BY c.id`,
+    [prevStart, prevNext],
   );
 
   const [trendRows] = await pool.query(
@@ -268,11 +488,39 @@ api.get('/summary', async (req, res) => {
 
   const current = trend[11];
   const previous = trend[10];
-  const shape = (rows, type, total) =>
-    rows.filter((r) => r.type === type).map((r) => ({
-      id: r.id, name: r.name, color: r.color, total: num(r.total), entries: num(r.entries),
-      share: total > 0 ? num(r.total) / total : 0,
-    }));
+  // Roll sub-categories up into their parent and keep them as `children`.
+  const shape = (rows, type, total) => {
+    const groups = new Map();
+    for (const r of rows.filter((x) => x.type === type)) {
+      const rootId = r.parent_id ?? r.id;
+      if (!groups.has(rootId)) {
+        groups.set(rootId, {
+          id: rootId,
+          name: r.parent_id ? r.parent_name : r.name,
+          color: r.parent_id ? r.parent_color : r.color,
+          total: 0, entries: 0, direct: 0, children: [],
+        });
+      }
+      const g = groups.get(rootId);
+      const amt = num(r.total);
+      g.total += amt;
+      g.entries += num(r.entries);
+      if (r.parent_id) g.children.push({ id: r.id, name: r.name, total: amt, entries: num(r.entries) });
+      else g.direct += amt;
+    }
+    return [...groups.values()]
+      .map((g) => {
+        const kids = g.children;
+        if (kids.length && g.direct > 0) kids.push({ id: g.id, name: 'General', total: g.direct, entries: 0 });
+        kids.sort((a, b) => b.total - a.total);
+        return {
+          id: g.id, name: g.name, color: g.color, total: g.total, entries: g.entries,
+          share: total > 0 ? g.total / total : 0,
+          children: kids.map((k) => ({ ...k, share: g.total > 0 ? k.total / g.total : 0 })),
+        };
+      })
+      .sort((a, b) => b.total - a.total);
+  };
 
   const [any] = await pool.query('SELECT 1 FROM transactions LIMIT 1');
 
@@ -284,6 +532,8 @@ api.get('/summary', async (req, res) => {
     savingsRate: current.income > 0 ? (current.income - current.expense) / current.income : null,
     previous: { month: previous.month, income: previous.income, expense: previous.expense },
     categories: shape(catRows, 'expense', current.expense),
+    prevCategories: shape(prevCatRows, 'expense', previous.expense),
+    daily: dailyRows.map((r) => ({ day: Number(r.d), total: num(r.total) })),
     incomeSources: shape(catRows, 'income', current.income),
     trend,
     budgets: (await budgetRows(month)).filter((b) => b.budget > 0),
@@ -297,11 +547,18 @@ api.get('/summary', async (req, res) => {
 api.get('/transactions', async (req, res) => {
   const where = [];
   const args = [];
-  if (req.query.month) {
+  if (isDate(req.query.from) || isDate(req.query.to)) {
+    if (isDate(req.query.from)) { where.push('t.tx_date >= ?'); args.push(req.query.from); }
+    if (isDate(req.query.to)) { where.push('t.tx_date <= ?'); args.push(req.query.to); }
+  } else if (req.query.month) {
     const [start, next] = monthRange(monthParam(req.query.month));
     where.push('t.tx_date >= ? AND t.tx_date < ?');
     args.push(start, next);
   }
+  const minAmt = Number(req.query.min);
+  const maxAmt = Number(req.query.max);
+  if (req.query.min !== undefined && req.query.min !== '' && Number.isFinite(minAmt)) { where.push('t.amount >= ?'); args.push(minAmt); }
+  if (req.query.max !== undefined && req.query.max !== '' && Number.isFinite(maxAmt)) { where.push('t.amount <= ?'); args.push(maxAmt); }
   if (['income', 'expense'].includes(req.query.type)) {
     where.push('t.type = ?');
     args.push(req.query.type);

@@ -31,6 +31,7 @@ const ICONS = {
   left: '<path d="M15 6l-6 6 6 6"/>',
   right: '<path d="M9 6l6 6-6 6"/>',
   close: '<path d="M6 6l12 12M18 6L6 18"/>',
+  chart: '<path d="M3 20h18"/><rect x="5" y="11" width="3" height="7" rx="1"/><rect x="10.5" y="6" width="3" height="12" rx="1"/><rect x="16" y="13" width="3" height="5" rx="1"/>',
   repeat: '<path d="M17 2l4 4-4 4"/><path d="M3 11V9a3 3 0 013-3h15"/><path d="M7 22l-4-4 4-4"/><path d="M21 13v2a3 3 0 01-3 3H3"/>',
 };
 const icon = (name, size = 22) =>
@@ -100,18 +101,24 @@ const m0 = (v) => fmt0.format(v);
 const m2 = (v) => (Number.isInteger(v) ? fmt0 : fmt2).format(v);
 const currencySymbol = () => fmt0.formatToParts(0).find((p) => p.type === 'currency')?.value ?? '';
 
+const EMPTY_FILTERS = { type: '', category: '', q: '', from: '', to: '', min: '', max: '' };
+
 const state = {
   meta: null,
   session: null,
   route: 'dashboard',
   month: thisMonth(),
-  filters: { type: '', category: '', q: '' },
+  filters: { ...EMPTY_FILTERS },
   summary: null,
   recent: [],
   txs: [],
   budgets: [],
   recurring: [],
   txIndex: new Map(),
+  quick: [],
+  goals: [],
+  report: null,
+  year: new Date().getFullYear(),
 };
 
 /* ---------- count-up animation ---------- */
@@ -166,6 +173,32 @@ function toast(message, kind = 'ok') {
   toastTimer = setTimeout(() => el.classList.remove('show'), 2800);
 }
 
+/* small form dialog (replaces prompt()) */
+function ask({ title, fields, submit = 'Save' }) {
+  return new Promise((resolve) => {
+    const d = document.createElement('dialog');
+    d.innerHTML = `<form class="sheet" method="dialog">
+      <div class="sheet-head"><h2>${esc(title)}</h2>
+        <button type="button" class="icon-btn" data-ask="cancel" aria-label="Close">${icon('close')}</button></div>
+      ${fields.map((f) => `<label class="field">${esc(f.label)}
+        <input name="${esc(f.name)}" type="${f.type || 'text'}" ${f.type === 'number' ? 'inputmode="decimal" step="any" min="0"' : ''}
+          placeholder="${esc(f.placeholder || '')}" value="${esc(f.value ?? '')}" required></label>`).join('')}
+      <div class="sheet-actions"><button type="button" class="btn" data-ask="cancel">Cancel</button>
+        <button class="btn primary" type="submit">${esc(submit)}</button></div>
+    </form>`;
+    document.body.appendChild(d);
+    const done = (v) => { d.close(); d.remove(); resolve(v); };
+    d.addEventListener('click', (e) => { if (e.target === d || e.target.closest('[data-ask="cancel"]')) done(null); });
+    d.addEventListener('cancel', (e) => { e.preventDefault(); done(null); });
+    d.querySelector('form').addEventListener('submit', (e) => {
+      e.preventDefault();
+      done(Object.fromEntries(new FormData(e.target)));
+    });
+    d.showModal();
+    d.querySelector('input').focus();
+  });
+}
+
 function indexTxs(list) {
   for (const t of list) state.txIndex.set(t.id, t);
 }
@@ -218,35 +251,26 @@ function pendingBanner(s) {
   </div>`;
 }
 
-/* Groups sub-categories under their parent: Market Items = Veg + Non-Veg */
+/* The server already rolls sub-categories up into their parent and sends them as `children`. */
 function groupCats(cats) {
-  const byId = new Map(state.meta.categories.map((c) => [c.id, c]));
-  const groups = new Map();
-  for (const c of cats) {
-    const pid = byId.get(c.id)?.parent_id;
-    const key = pid || c.id;
-    if (!groups.has(key)) {
-      const p = byId.get(key) || c;
-      groups.set(key, { id: key, name: p.name, color: p.color, total: 0, share: 0, subs: [] });
-    }
-    const g = groups.get(key);
-    g.total += c.total;
-    g.share += c.share;
-    if (pid) g.subs.push(c);
-  }
-  return [...groups.values()].sort((a, b) => b.total - a.total);
+  return cats
+    .map((c) => ({
+      id: c.id, name: c.name, color: c.color, total: c.total, share: c.share,
+      subs: c.children || [],
+    }))
+    .sort((a, b) => b.total - a.total);
 }
 
 function donutHTML(cats, total) {
   const R = 15.9155;
-  const top = cats.slice(0, 6).map((c) => ({ name: c.name, color: c.color, v: c.total }));
+  const top = cats.slice(0, 6).map((c) => ({ id: c.id, name: c.name, color: c.color, v: c.total }));
   const rest = cats.slice(6).reduce((a, c) => a + c.total, 0);
   if (rest > 0) top.push({ name: 'Other categories', color: 'var(--muted-2)', v: rest });
   let acc = 0;
   const arcs = top.map((p) => {
     const pct = (p.v / total) * 100;
     const dash = Math.max(pct - 0.7, 0.1);
-    const el = `<circle r="${R}" cx="21" cy="21" fill="none" stroke="${esc(p.color)}" stroke-width="5"
+    const el = `<circle class="slice" ${p.id ? `data-action="cat" data-id="${p.id}"` : ''} r="${R}" cx="21" cy="21" fill="none" stroke="${esc(p.color)}" stroke-width="5"
       stroke-dasharray="${dash.toFixed(2)} ${(100 - dash).toFixed(2)}" stroke-dashoffset="${(-acc).toFixed(2)}"><title>${esc(p.name)}: ${m0(p.v)}</title></circle>`;
     acc += pct;
     return el;
@@ -361,12 +385,16 @@ function maybeCelebrate() {
 
 /* ---------- dashboard ---------- */
 async function loadDashboard() {
-  const [summary, recent] = await Promise.all([
+  const [summary, recent, quick, goals] = await Promise.all([
     api(`/summary?month=${state.month}`),
     api(`/transactions?month=${state.month}&limit=6`),
+    api('/quick').catch(() => []),
+    api('/goals').catch(() => []),
   ]);
   state.summary = summary;
   state.recent = recent;
+  state.quick = quick;
+  state.goals = goals;
   indexTxs(recent);
 }
 
@@ -392,6 +420,113 @@ function emptyMonth(s) {
       <button class="btn" data-action="add-expense">Add spending</button>
     </div>
   </section>`;
+}
+
+/* One expandable category row with its sub-categories underneath */
+function catItemHTML(g, open) {
+  const has = g.subs.length > 0;
+  const subs = has ? `<div class="subs"><ul>${g.subs.map((sc) => `
+      <li class="sub-item">
+        <div class="sub-line"><span>${esc(sc.name)}</span><b>${m0(sc.total)}</b></div>
+        <div class="sub-bar"><i style="--p:${(sc.share * 100).toFixed(1)}"></i></div>
+        <small>${Math.round(sc.share * 100)}% of ${esc(g.name)}${sc.entries ? ` · ${sc.entries} ${sc.entries === 1 ? 'entry' : 'entries'}` : ''}</small>
+      </li>`).join('')}</ul></div>` : '';
+  return `<li class="cat-item ${open ? 'open' : ''}" style="--c:${esc(g.color)}">
+    <div class="cat-head">
+      <button class="cat-row" data-action="cat" data-id="${g.id}" style="--c:${esc(g.color)}">
+        <span class="dot"></span><span>${catLabel(g.name)}</span><span class="amt">${m0(g.total)}</span>
+        <small>${Math.round(g.share * 100)}% of spending</small>
+        <span class="cat-bar"><i style="--p:${(g.share * 100).toFixed(1)}"></i></span>
+      </button>
+      ${has ? `<button class="cat-toggle" data-action="toggle-cat" aria-expanded="${open}" aria-label="Show sub-categories of ${esc(g.name)}">${g.subs.length} sub<span class="chev"></span></button>` : ''}
+    </div>
+    ${subs}
+  </li>`;
+}
+
+/* ---------- quick add, day by day, compare, goals ---------- */
+function quickHTML() {
+  if (!state.quick.length || state.month !== thisMonth()) return '';
+  return `<section class="panel quick">
+    <div class="panel-head"><h2>Quick add</h2><small>Tap to add it for today</small></div>
+    <div class="quick-row">${state.quick.map((q, i) => `
+      <button class="quick-chip" data-action="quick" data-i="${i}" style="--c:${esc(q.color)}">
+        <span class="q-ic">${catEmoji(q.category) || '+'}</span>
+        <span class="q-t"><b>${esc(q.note || q.category)}</b><small>${m0(q.amount)}</small></span>
+      </button>`).join('')}</div>
+  </section>`;
+}
+
+function dailyHTML(s) {
+  if (!s.expense) return '';
+  const [y, m] = state.month.split('-').map(Number);
+  const days = new Date(y, m, 0).getDate();
+  const byDay = new Map(s.daily.map((d) => [d.day, d.total]));
+  const vals = Array.from({ length: days }, (_, i) => byDay.get(i + 1) || 0);
+  const max = Math.max(...vals, 1);
+  const isNow = state.month === thisMonth();
+  const todayN = new Date().getDate();
+  const weeks = [];
+  for (let i = 0; i < days; i += 7) {
+    weeks.push({ label: `${i + 1}–${Math.min(i + 7, days)}`, total: vals.slice(i, i + 7).reduce((a, v) => a + v, 0) });
+  }
+  const last7 = isNow ? vals.slice(Math.max(todayN - 7, 0), todayN).reduce((a, v) => a + v, 0) : null;
+  const peakDay = vals.indexOf(Math.max(...vals)) + 1;
+  return `<section class="panel daily">
+    <div class="panel-head"><h2>Day by day</h2>${last7 !== null ? `<span class="pill">Last 7 days ${m0(last7)}</span>` : ''}</div>
+    <div class="days" role="img" aria-label="Spending for each day of ${monthLabel(state.month)}">${vals.map((v, i) =>
+      `<i class="dbar ${isNow && i + 1 === todayN ? 'today' : ''} ${v === 0 ? 'zero' : ''}" style="--h:${((v / max) * 100).toFixed(1)}" title="${i + 1} ${monthLabel(state.month, 'short')}: ${m0(v)}"></i>`).join('')}</div>
+    <div class="weeks">${weeks.map((w) => `<div class="wk"><small>Days ${w.label}</small><b>${m0(w.total)}</b></div>`).join('')}</div>
+    <small class="peak">Biggest day: ${peakDay} ${monthLabel(state.month, 'short')}, ${m0(vals[peakDay - 1])}</small>
+  </section>`;
+}
+
+function compareHTML(s) {
+  const prev = s.prevCategories || [];
+  if (!prev.length || !s.expense) return '';
+  const prevMap = new Map(prev.map((c) => [c.id, c]));
+  const rows = s.categories.slice(0, 6).map((c) => {
+    const was = prevMap.get(c.id)?.total || 0;
+    const diff = c.total - was;
+    const pct = was > 0 ? Math.round((diff / was) * 100) : null;
+    const top = Math.max(c.total, was, 1);
+    const chip = pct === null ? 'New' : diff === 0 ? 'Same' : `${diff > 0 ? '▲' : '▼'} ${Math.abs(pct)}%`;
+    return `<li style="--c:${esc(c.color)}">
+      <div class="cmp-top"><span>${catLabel(c.name)}</span><span class="cmp-chip ${diff > 0 ? 'up' : diff < 0 ? 'down' : ''}">${chip}</span></div>
+      <div class="cmp-bars"><i class="now" style="--w:${((c.total / top) * 100).toFixed(1)}"></i><i class="was" style="--w:${((was / top) * 100).toFixed(1)}"></i></div>
+      <div class="cmp-note"><small>${m0(c.total)} now</small><small>${m0(was)} in ${monthLabel(s.previous.month, 'short')}</small></div>
+    </li>`;
+  }).join('');
+  return `<section class="panel compare">
+    <div class="panel-head"><h2>Compared with ${monthLabel(s.previous.month)}</h2></div>
+    <ul class="cmp-list">${rows}</ul>
+  </section>`;
+}
+
+function ringHTML(pct, color) {
+  const p = Math.min(Math.max(pct, 0), 100);
+  return `<svg class="ring" viewBox="0 0 42 42" aria-hidden="true">
+    <circle r="15.9155" cx="21" cy="21" fill="none" stroke="var(--line)" stroke-width="4.5"/>
+    <circle class="ring-fg" r="15.9155" cx="21" cy="21" fill="none" stroke="${esc(color)}" stroke-width="4.5" stroke-linecap="round"
+      stroke-dasharray="${p.toFixed(1)} ${(100 - p).toFixed(1)}" transform="rotate(-90 21 21)"/></svg>`;
+}
+
+function goalsHTML() {
+  const head = `<div class="panel-head"><h2>Savings goals</h2><button class="link" data-action="goal-new">+ New goal</button></div>`;
+  if (!state.goals.length) {
+    return `<section class="panel goals">${head}<p class="empty-note"><small>Saving for something? Set a target and watch the ring fill up.</small></p>
+      <p style="margin-top:12px"><button class="btn small" data-action="goal-new">Create a goal</button></p></section>`;
+  }
+  return `<section class="panel goals">${head}<ul class="goal-list">${state.goals.map((g) => {
+    const pct = g.target > 0 ? (g.saved / g.target) * 100 : 0;
+    const done = pct >= 100;
+    return `<li class="goal ${done ? 'done' : ''}" style="--c:${esc(g.color)}">
+      <div class="goal-ring">${ringHTML(pct, g.color)}<b>${Math.min(Math.round(pct), 100)}%</b></div>
+      <div class="goal-main"><b>${esc(g.name)}${done ? ' 🎉' : ''}</b><small>${m0(g.saved)} of ${m0(g.target)}</small>${done ? '' : `<small>${m0(g.target - g.saved)} to go</small>`}</div>
+      <div class="goal-act"><button class="btn small" data-action="goal-add" data-id="${g.id}">+ Add</button>
+        <button class="icon-btn" data-action="goal-del" data-id="${g.id}" aria-label="Delete goal ${esc(g.name)}">${icon('close', 18)}</button></div>
+    </li>`;
+  }).join('')}</ul></section>`;
 }
 
 function renderDashboard() {
@@ -431,26 +566,19 @@ function renderDashboard() {
     </div>
   </section>`;
 
+  const firstWithSubs = groups.findIndex((g) => g.subs.length > 0);
   const breakdown = s.expense > 0 ? `<section class="panel">
     <div class="panel-head"><h2>Where the money went</h2></div>
     <div class="split">
       ${donutHTML(groups, s.expense)}
-      <ul class="cat-list">${groups.map((g) => `<li>
-        <button class="cat-row" data-action="cat" data-id="${g.id}" style="--c:${esc(g.color)}">
-          <span class="dot"></span><span>${catLabel(g.name)}</span><span class="amt">${m0(g.total)}</span>
-          <small>${Math.round(g.share * 100)}% of spending</small>
-        </button>
-        ${g.subs.map((sc) => `<button class="cat-row sub" data-action="cat" data-id="${sc.id}" style="--c:${esc(g.color)}">
-          <span class="dot"></span><span>${esc(sc.name)}</span><span class="amt">${m0(sc.total)}</span>
-        </button>`).join('')}
-      </li>`).join('')}</ul>
+      <ul class="cat-list">${groups.map((g, i) => catItemHTML(g, i === firstWithSubs)).join('')}</ul>
     </div>
   </section>` : '';
 
   const max = Math.max(...s.trend.flatMap((t) => [t.income, t.expense]), 1);
   const trendDesc = s.trend.map((t) => `${monthLabel(t.month, 'short')}: ${m0(t.income)} in, ${m0(t.expense)} out`).join('; ');
   const trend = `<section class="panel">
-    <div class="panel-head"><h2>Last 12 months</h2></div>
+    <div class="panel-head"><h2>Last 12 months</h2><a class="link" href="#/report">Yearly report</a></div>
     <div class="trend" role="img" aria-label="${esc(trendDesc)}">${s.trend.map((t) => `
       <div class="tcol ${t.month === state.month ? 'now' : ''}">
         <div class="tbars">
@@ -476,13 +604,18 @@ function renderDashboard() {
     <div>${state.recent.map(txRow).join('')}</div>
   </section>`;
 
-  return `<div class="stack dashboard-stack">${hero}${pendingBanner(s)}${insightsHTML(s)}<div class="grid">${breakdown}${trend}${budgets}${recent}</div></div>`;
+  return `<div class="stack dashboard-stack">${hero}${pendingBanner(s)}${quickHTML()}${insightsHTML(s)}<div class="grid">${breakdown}${compareHTML(s)}${dailyHTML(s)}${trend}${budgets}${goalsHTML()}${recent}</div></div>`;
 }
 
 /* ---------- transactions ---------- */
 async function fetchTxs() {
   const f = state.filters;
-  const qs = new URLSearchParams({ month: state.month, limit: '500' });
+  const qs = new URLSearchParams({ limit: '500' });
+  if (!f.from && !f.to) qs.set('month', state.month);
+  if (f.from) qs.set('from', f.from);
+  if (f.to) qs.set('to', f.to);
+  if (f.min) qs.set('min', f.min);
+  if (f.max) qs.set('max', f.max);
   if (f.type) qs.set('type', f.type);
   if (f.category) qs.set('category', f.category);
   if (f.q) qs.set('q', f.q);
@@ -494,7 +627,7 @@ const loadTransactions = fetchTxs;
 function txListHTML() {
   const list = state.txs;
   if (!list.length) {
-    return `<div class="empty"><h2>No entries found</h2><p>${state.filters.q || state.filters.category || state.filters.type
+    return `<div class="empty"><h2>No entries found</h2><p>${state.filters.q || state.filters.category || state.filters.type || state.filters.from || state.filters.to || state.filters.min || state.filters.max
       ? 'Try clearing a filter.' : `Nothing has been added for ${monthLabel(state.month)} yet.`}</p></div>`;
   }
   let html = '';
@@ -523,6 +656,13 @@ function renderTransactions() {
         <input type="search" id="tx-search" placeholder="Search notes" value="${esc(f.q)}" aria-label="Search entries">
         <select id="tx-cat" aria-label="Filter by category"><option value="">All categories</option>${cats}</select>
       </div>
+      <div class="filter-more">
+        <label class="field">From<input type="date" id="tx-from" value="${esc(f.from)}"></label>
+        <label class="field">To<input type="date" id="tx-to" value="${esc(f.to)}"></label>
+        <label class="field">Min amount<input type="number" id="tx-min" inputmode="decimal" min="0" placeholder="0" value="${esc(f.min)}"></label>
+        <label class="field">Max amount<input type="number" id="tx-max" inputmode="decimal" min="0" placeholder="Any" value="${esc(f.max)}"></label>
+        ${f.from || f.to || f.min || f.max ? '<button class="btn small" data-action="filters-clear">Clear</button>' : ''}
+      </div>
     </div>
     <div class="tx-totals" id="tx-totals">${txTotalsHTML()}</div>
     <section class="panel" style="padding-top:4px;padding-bottom:8px"><div id="tx-list">${txListHTML()}</div></section>`;
@@ -538,8 +678,13 @@ async function refreshTxList() {
 async function loadBudgets() {
   state.budgets = await api(`/budgets?month=${state.month}`);
 }
+const orderBudgets = (list) => list.filter((b) => !b.parent_id)
+  .flatMap((p) => [p, ...list.filter((b) => b.parent_id === p.id)]);
+
 function budgetTotalsHTML() {
-  const set = state.budgets.filter((b) => b.budget > 0);
+  // a sub-category limit is already inside its parent's limit, so don't count it twice
+  const parentSet = new Set(state.budgets.filter((b) => !b.parent_id && b.budget > 0).map((b) => b.id));
+  const set = state.budgets.filter((b) => b.budget > 0 && !(b.parent_id && parentSet.has(b.parent_id)));
   const budget = set.reduce((a, b) => a + b.budget, 0);
   const spent = set.reduce((a, b) => a + b.spent, 0);
   return set.length
@@ -549,8 +694,8 @@ function budgetTotalsHTML() {
 function renderBudgets() {
   return `<div class="stack">
     <section class="panel" id="b-total">${budgetTotalsHTML()}</section>
-    <section class="panel">${state.budgets.map((b) => `
-      <div class="b-edit" data-row="${b.id}" style="--c:${esc(b.color)}">
+    <section class="panel">${orderBudgets(state.budgets).map((b) => `
+      <div class="b-edit ${b.parent_id ? 'is-sub' : ''}" data-row="${b.id}" style="--c:${esc(b.color)}">
         <label class="name" for="b-${b.id}"><span class="dot"></span>${catLabel(b.name)}</label>
         <input class="budget-input" id="b-${b.id}" data-id="${b.id}" inputmode="numeric" placeholder="No limit" value="${b.budget || ''}" aria-label="Monthly budget for ${esc(b.name)}">
         <div class="meter-slot">${meterHTML(b)}</div>
@@ -585,7 +730,7 @@ function renderSettings() {
   const categoryRows = orderedCats(sorted).map((c) => `<div class="category-manage-row ${c.parent_id ? 'sub' : ''}">
       <span class="category-chip" style="--c:${esc(c.color)}"><i></i>${catLabel(c.name)}</span>
       <small>${c.type === 'expense' ? 'Spending' : 'Income'}</small>
-      ${c.parent_id ? '' : `<button class="btn small" data-action="add-sub" data-id="${c.id}">+ sub</button>`}
+      <span class="row-actions">${c.parent_id ? '' : `<button class="btn small" data-action="add-sub" data-id="${c.id}">+ sub</button>`}<button class="btn small danger" data-action="del-cat" data-id="${c.id}" aria-label="Delete ${esc(c.name)}">Delete</button></span>
     </div>`).join('');
   const rec = state.recurring.length
     ? state.recurring.map((r) => `<div class="rec-row" style="--c:${esc(r.color)}">
@@ -625,6 +770,8 @@ function renderSettings() {
     </section>
     <section class="panel">
       <div class="panel-head"><h2>Your data</h2></div>
+      <div class="set-row"><p>Backup<small>Download a full copy of your book (entries, categories, budgets, goals) as one file. Do this once a month.</small></p>
+        <a class="btn small primary" href="/api/backup.json" download>Download backup</a></div>
       <div class="set-row"><p>Export everything<small>Download all entries as a spreadsheet file (CSV).</small></p>
         <div class="export-actions">
           <a class="btn small primary" href="/api/export.xlsx" download>Download Excel</a>
@@ -643,11 +790,92 @@ function renderSettings() {
   </div>`;
 }
 
+/* ---------- yearly report ---------- */
+async function loadReport() {
+  state.report = await api(`/report?year=${state.year}`);
+}
+
+function reportCatHTML(c, i, activeMonths) {
+  const top = Math.max(...c.months, 1);
+  const spark = c.months.map((v) => `<i style="--h:${((v / top) * 100).toFixed(0)}"></i>`).join('');
+  const has = c.children.length > 0;
+  const subs = has ? `<div class="subs"><ul>${c.children.map((k) => `
+      <li class="sub-item">
+        <div class="sub-line"><span>${esc(k.name)}</span><b>${m0(k.total)}</b></div>
+        <div class="sub-bar"><i style="--p:${(k.share * 100).toFixed(1)}"></i></div>
+        <small>${Math.round(k.share * 100)}% of ${esc(c.name)}</small>
+      </li>`).join('')}</ul></div>` : '';
+  return `<li class="cat-item rep-item ${i === 0 && has ? 'open' : ''}" style="--c:${esc(c.color)}">
+    <button class="rep-head" data-action="toggle-cat" aria-label="Show details for ${esc(c.name)}">
+      <span class="rank">${i + 1}</span>
+      <span class="rep-main"><b>${catLabel(c.name)}</b>
+        <span class="rep-bar"><i style="--p:${(c.share * 100).toFixed(1)}"></i></span>
+        <small>${Math.round(c.share * 100)}% of spending · about ${m0(c.total / Math.max(activeMonths, 1))} a month</small></span>
+      <span class="spark" aria-hidden="true">${spark}</span>
+      <span class="rep-amt">${m0(c.total)}</span>
+      ${has ? '<span class="chev"></span>' : '<span class="chev-gap"></span>'}
+    </button>${subs}
+  </li>`;
+}
+
+function renderReport() {
+  const r = state.report;
+  const yearNav = `<div class="year-nav">
+    <button class="icon-btn" data-action="year-prev" aria-label="Previous year">${icon('left')}</button>
+    <b>${r.year}</b>
+    <button class="icon-btn" data-action="year-next" aria-label="Next year">${icon('right')}</button></div>`;
+  if (!r.income && !r.expense) {
+    return `<div class="stack"><section class="panel empty"><h2>Nothing in ${r.year} yet</h2>
+      <p>Entries you add for ${r.year} will build this report.</p>${yearNav}</section></div>`;
+  }
+  const rate = r.savingsRate === null ? '–' : `${Math.round(r.savingsRate * 100)}%`;
+  const act = r.months.filter((m) => m.income || m.expense);
+  const best = [...act].sort((a, b) => (b.income - b.expense) - (a.income - a.expense))[0];
+  const peak = [...act].sort((a, b) => b.expense - a.expense)[0];
+  const avg = r.expense / Math.max(r.activeMonths, 1);
+  const hero = `<section class="hero ${r.saved < 0 ? 'over' : ''}">
+    <div class="hero-top">
+      <div><div class="hero-label">${r.saved < 0 ? 'Overspent in' : 'Saved in'} ${r.year}</div>
+        <div class="hero-big">${m0(Math.abs(r.saved))}</div></div>
+      ${yearNav}
+    </div>
+    <div class="kpis">
+      <div class="kpi"><small>Income</small><b>${m0(r.income)}</b></div>
+      <div class="kpi"><small>Spent</small><b>${m0(r.expense)}</b></div>
+      <div class="kpi"><small>Kept</small><b>${rate}</b><small>of income</small></div>
+    </div>
+  </section>`;
+  const stats = `<div class="stat-row">
+    <div class="stat"><small>Average spend a month</small><b>${m0(avg)}</b></div>
+    <div class="stat"><small>Highest spending month</small><b>${peak ? monthLabel(peak.month) : '–'}</b><small>${peak ? m0(peak.expense) : ''}</small></div>
+    <div class="stat"><small>Best saving month</small><b>${best ? monthLabel(best.month) : '–'}</b><small>${best ? `${m0(best.income - best.expense)} kept` : ''}</small></div>
+  </div>`;
+  const max = Math.max(...r.months.flatMap((t) => [t.income, t.expense]), 1);
+  const chart = `<section class="panel">
+    <div class="panel-head"><h2>Month by month</h2></div>
+    <div class="trend">${r.months.map((t) => `
+      <div class="tcol ${best && t.month === best.month ? 'now' : ''}">
+        <div class="tbars">
+          <i class="bar in" style="--h:${((t.income / max) * 100).toFixed(1)}" title="Income ${m0(t.income)}"></i>
+          <i class="bar out" style="--h:${((t.expense / max) * 100).toFixed(1)}" title="Spent ${m0(t.expense)}"></i>
+        </div>
+        <span class="tm">${monthLabel(t.month, 'short')}</span>
+      </div>`).join('')}</div>
+    <div class="key"><span><i style="background:var(--pos)"></i>Income</span><span><i style="background:var(--neg)"></i>Spent</span></div>
+  </section>`;
+  const cats = `<section class="panel">
+    <div class="panel-head"><h2>Where ${r.year} went</h2><a class="link" href="/api/export.xlsx" download>Download Excel</a></div>
+    <ul class="rep-list">${r.categories.map((c, i) => reportCatHTML(c, i, r.activeMonths)).join('')}</ul>
+  </section>`;
+  return `<div class="stack report-stack">${hero}${stats}${chart}${cats}</div>`;
+}
+
 /* ---------- routing ---------- */
 const ROUTES = {
   dashboard: { title: 'Dashboard', months: true, load: loadDashboard, render: renderDashboard },
   transactions: { title: 'Transactions', months: true, load: loadTransactions, render: renderTransactions },
   budgets: { title: 'Budgets', months: true, load: loadBudgets, render: renderBudgets },
+  report: { title: 'Yearly report', months: false, load: loadReport, render: renderReport },
   settings: { title: 'Settings', months: false, load: loadSettings, render: renderSettings },
 };
 
@@ -798,13 +1026,81 @@ document.addEventListener('click', async (e) => {
       case 'add': openEntry(); break;
       case 'add-income': openEntry(null, 'income'); break;
       case 'add-expense': openEntry(null, 'expense'); break;
+      case 'toggle-cat': {
+        const open = el.closest('.cat-item').classList.toggle('open');
+        el.setAttribute('aria-expanded', String(open));
+        break;
+      }
+      case 'del-cat':
+        if (!confirmTwice(el, 'Tap again')) break;
+        await api(`/categories/${el.dataset.id}`, { method: 'DELETE' });
+        toast('Category deleted');
+        await refresh();
+        break;
+      case 'quick': {
+        const q = state.quick[Number(el.dataset.i)];
+        if (!q) break;
+        el.disabled = true;
+        try {
+          await api('/transactions', {
+            method: 'POST',
+            body: { type: q.type, category_id: q.category_id, amount: q.amount, date: todayStr(), note: q.note },
+          });
+          toast(`Added ${q.note || q.category}, ${m0(q.amount)}`);
+          await refresh();
+        } finally { el.disabled = false; }
+        break;
+      }
+      case 'goal-new': {
+        const v = await ask({
+          title: 'New savings goal', submit: 'Create goal',
+          fields: [
+            { name: 'name', label: 'What are you saving for', placeholder: 'New bike' },
+            { name: 'target', label: 'Target amount', type: 'number', placeholder: '50000' },
+          ],
+        });
+        if (!v) break;
+        await api('/goals', { method: 'POST', body: { name: v.name, target: Number(v.target) } });
+        toast('Goal created');
+        await refresh();
+        break;
+      }
+      case 'goal-add': {
+        const g = state.goals.find((x) => x.id === Number(el.dataset.id));
+        if (!g) break;
+        const v = await ask({
+          title: `Add to ${g.name}`, submit: 'Add money',
+          fields: [{ name: 'add', label: 'Amount', type: 'number', placeholder: '1000' }],
+        });
+        if (!v) break;
+        const out = await api(`/goals/${g.id}`, { method: 'PUT', body: { add: Number(v.add) } });
+        if (g.saved < g.target && out.saved >= out.target) { confetti(); toast(`Goal reached: ${out.name} 🎉`); }
+        else toast('Added to your goal');
+        await refresh();
+        break;
+      }
+      case 'goal-del':
+        if (!confirmTwice(el, 'Sure?')) break;
+        await api(`/goals/${el.dataset.id}`, { method: 'DELETE' });
+        toast('Goal deleted');
+        await refresh();
+        break;
+      case 'year-prev': state.year -= 1; await refresh(); break;
+      case 'year-next': state.year += 1; await refresh(); break;
+      case 'filters-clear':
+        state.filters = { ...EMPTY_FILTERS, type: state.filters.type };
+        await refresh();
+        break;
       case 'add-sub': {
         const parent = state.meta.categories.find((c) => c.id === Number(el.dataset.id));
-        const name = prompt(`New sub-category under "${parent.name}"`);
-        if (!name || !name.trim()) break;
+        const v = await ask({
+          title: `New sub-category under ${parent.name}`, submit: 'Add sub-category',
+          fields: [{ name: 'name', label: 'Name', placeholder: 'Vegetables and fruit' }],
+        });
+        if (!v || !v.name.trim()) break;
         await api('/categories', {
           method: 'POST',
-          body: { name: name.trim(), type: parent.type, color: parent.color, parent_id: parent.id },
+          body: { name: v.name.trim(), type: parent.type, color: parent.color, parent_id: parent.id },
         });
         state.meta = await api('/meta');
         toast('Sub-category added');
@@ -828,7 +1124,7 @@ document.addEventListener('click', async (e) => {
         await refresh();
         break;
       case 'cat':
-        state.filters = { type: 'expense', category: el.dataset.id, q: '' };
+        state.filters = { ...EMPTY_FILTERS, type: 'expense', category: el.dataset.id };
         if (location.hash === '#/transactions') await refresh(); else location.hash = '#/transactions';
         break;
       case 'apply-recurring': {
@@ -880,6 +1176,11 @@ document.addEventListener('change', async (e) => {
   try {
     if (e.target.matches('input[name="type"]')) fillCategories(e.target.value);
     else if (e.target.id === 'tx-cat') { state.filters.category = e.target.value; await refreshTxList(); }
+    else if (['tx-from', 'tx-to', 'tx-min', 'tx-max'].includes(e.target.id)) {
+      const key = { 'tx-from': 'from', 'tx-to': 'to', 'tx-min': 'min', 'tx-max': 'max' }[e.target.id];
+      state.filters[key] = e.target.value;
+      await refresh();
+    }
     else if (e.target.matches('.budget-input')) await saveBudget(e.target);
     else if (e.target.id === 'currency') {
       const { currency } = await api('/settings', { method: 'PUT', body: { currency: e.target.value } });
@@ -950,11 +1251,20 @@ $('#login-form').addEventListener('submit', async (e) => {
   }
 });
 
+function addReportNav() {
+  const nav = $('.nav');
+  if (!nav || $('[data-route="report"]', nav)) return;
+  const link = `<a href="#/report" data-route="report">${icon('chart')}<span>Reports</span></a>`;
+  const settings = $('[data-route="settings"]', nav);
+  if (settings) settings.insertAdjacentHTML('beforebegin', link); else nav.insertAdjacentHTML('beforeend', link);
+}
+
 async function boot() {
   state.session = await fetch('/api/session').then((r) => r.json());
   if (state.session.authRequired && !state.session.authenticated) return showLogin();
   $('#login').hidden = true;
   $('#app').hidden = false;
+  addReportNav();
   state.meta = await api('/meta');
   setCurrency(state.meta.currency);
   onRoute();
